@@ -255,3 +255,18 @@ let rx_totalbytes t =
   Sequence.(to_int (sub t.rx_nxt t.rx_isn))
   
 
+let get_Snapshot_Log t =
+	let wndArr = [|
+		Sequence.to_int t.tx_nxt;
+		Sequence.to_int t.ack_seq;
+		Sequence.to_int t.snd_una;
+		Sequence.to_int t.rx_nxt;
+		t.backoff_count;
+		Int32.to_int t.tx_wnd;
+		Int32.to_int t.rx_wnd;
+		Int32.to_int t.cwnd;
+		Int32.to_int t.ssthresh;
+		(match t.fast_recovery with |true -> 1 |false ->0);
+		Sequence.to_int t.fast_rec_th
+	|] in
+	wndArr

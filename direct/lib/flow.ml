@@ -36,6 +36,21 @@ module TCPv4 = struct
   let close t =
     Tcp.Pcb.close t
 
+  let getRawLogDump t =
+   Tcp.Pcb.getRawLogDump t
+    
+  let getLogDumpCopy t =
+   Tcp.Pcb.getLogDumpCopy t
+   
+   let startLogging t =
+   Tcp.Pcb.startLogging t
+   
+   let stopLogging t =
+   Tcp.Pcb.stopLogging t
+   
+   let cleanLog t =
+   Tcp.Pcb.cleanLog t  
+
   let listen mgr src fn =
     let addr, port = src in
     let tcps = Manager.tcpv4_of_addr mgr addr in
@@ -132,4 +147,25 @@ let listen mgr = function
      Shmem.listen mgr src (fun dst t -> fn dst (Shmem t))
   |_ -> fail (Failure "unknown protocol")
 
+
+
+let getRawLogDump = function
+  | TCPv4 t -> TCPv4.getRawLogDump t
+  | _ -> print_string "Non supported feaute (only available for TCP)"; []
+  
+let getLogDumpCopy = function
+  | TCPv4 t -> TCPv4.getLogDumpCopy t
+  | _ -> print_string "Non supported feaute (only available for TCP)"; []
+  
+let startLogging = function
+  | TCPv4 t -> TCPv4.startLogging t
+  | _ -> print_string "Non supported feaute (only available for TCP)"; return false
+  
+let stopLogging = function
+  | TCPv4 t -> TCPv4.stopLogging t
+  | _ -> print_string "Non supported feaute (only available for TCP)"; return false
+  
+let cleanLog = function
+  | TCPv4 t -> TCPv4.cleanLog t
+  | _ -> print_string "Non supported feaute (only available for TCP)"; return ()
 

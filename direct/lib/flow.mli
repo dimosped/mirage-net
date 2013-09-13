@@ -46,3 +46,9 @@ val listen :
    | `TCPv4 of ipv4_src * (ipv4_dst -> t -> unit Lwt.t)
   ] -> unit Lwt.t
 
+
+val getRawLogDump: t -> (float * float * string * string * int array) list
+val getLogDumpCopy: t -> (float * float * string * string * int array) list
+val startLogging: t -> bool Lwt.t
+val stopLogging: t -> bool Lwt.t
+val cleanLog: t -> unit Lwt.t

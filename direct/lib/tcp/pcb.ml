@@ -21,6 +21,14 @@ open Printf
 open State
 open Wire
 
+
+type pcb_log_info = {
+  doLogging: bool ref;
+  logHistory: (float * float * string * string * int array) list ref;
+  historyLogLock: Lwt_mutex.t ref;
+}
+
+
 type pcb = {
   id: id;
   wnd: Window.t;            (* Window information *)
@@ -32,6 +40,7 @@ type pcb = {
   urx_close_t: unit Lwt.t;  (* App rx close thread *)
   urx_close_u: unit Lwt.u;  (* App rx connection close wakener *)
   utx: User_buffer.Tx.t;    (* App tx buffer *)
+  logInfo: pcb_log_info		(*  Structure keeping Tcp Logging info *)
 }
 
 type connection = (pcb * unit Lwt.t) 
@@ -57,16 +66,36 @@ let verify_checksum pkt = true
 let wscale_default = 2
 
 module Tx = struct
+	(* Log the transmitted segment *)
+	let logTxSegment logHistory historyLogLock seqNum ackNum tReq = 
+    Lwt_mutex.lock !historyLogLock >>
+    Lwt.return ( 
+		let newTuple = ( (OS.Clock.time ()), ((OS.Clock.time ()) -. tReq), "TX", "SEG", [|(Sequence.to_int seqNum); (Sequence.to_int ackNum)|] ) in
+		logHistory := newTuple::(!logHistory) 
+    ) 
+    >>
+    (
+		Lwt_mutex.unlock !historyLogLock;
+		return ()
+    )
 
   (* Output a TCP packet, and calculate some settings from a state descriptor *)
-  let xmit_pcb ip id ~flags ~wnd ~options ~seq datav =
+  let xmit_pcb ip id logInfo ~flags ~wnd ~options ~seq datav =
     let window = Int32.to_int (Window.rx_wnd_unscaled wnd) in
     let rx_ack = Some (Window.rx_nxt wnd) in
     let syn = match flags with Segment.Tx.Syn -> true |_ -> false in
     let fin = match flags with Segment.Tx.Fin -> true |_ -> false in
     let rst = match flags with Segment.Tx.Rst -> true |_ -> false in
     let psh = match flags with Segment.Tx.Psh -> true |_ -> false in
-    xmit ~ip ~id ~syn ~fin ~rst ~psh ~rx_ack ~seq ~window ~options datav
+    if !(logInfo.doLogging) then 
+    begin
+		let timeOfRequest = OS.Clock.time () in
+		xmit ~ip ~id ~syn ~fin ~rst ~psh ~rx_ack ~seq ~window ~options datav
+		>>
+		logTxSegment logInfo.logHistory logInfo.historyLogLock seq (Window.rx_nxt wnd) timeOfRequest
+	end 
+	else
+		xmit ~ip ~id ~syn ~fin ~rst ~psh ~rx_ack ~seq ~window ~options datav
 
   (* Output an RST response when we dont have a PCB *)
   let send_rst {ip} id ~sequence ~ack_number ~syn ~fin =
@@ -106,7 +135,7 @@ module Tx = struct
       let options = [] in
       let seq = Window.tx_nxt wnd in
       Ack.Delayed.transmit ack ack_number >>
-      xmit_pcb t.ip pcb.id ~flags ~wnd ~options ~seq [] >>
+      xmit_pcb t.ip pcb.id pcb.logInfo ~flags ~wnd ~options ~seq [] >>
       send_empty_ack () in
     (* When something transmits an ACK, tell the delayed ACK thread *)
     let rec notify () =
@@ -117,6 +146,32 @@ module Tx = struct
 end
 
 module Rx = struct
+
+	let logWindow logHistory historyLogLock wnd = 
+	Lwt_mutex.lock !historyLogLock >>
+	Lwt.return (
+		let newTuple = ( (OS.Clock.time ()), 0.0, "WND", "UPD", (Window.get_Snapshot_Log wnd) ) in
+		logHistory := newTuple::(!logHistory)
+	) 
+	>>
+	(
+		Lwt_mutex.unlock !historyLogLock;
+		return ()
+	)
+	
+
+	let logRx logHistory historyLogLock seqNum ackNum = 
+    Lwt_mutex.lock !historyLogLock >>
+    Lwt.return (
+		let newTuple = ( (OS.Clock.time ()),  0.0, "RX", "SEG", [|(Sequence.to_int seqNum); (Sequence.to_int ackNum)|] ) in
+		logHistory := newTuple::(!logHistory)
+	) 
+	>>
+    (
+		Lwt_mutex.unlock !historyLogLock;
+		return ()
+    )
+    
 
   (* Process an incoming TCP packet that has an active PCB *)
   let input t pkt (pcb,_) =
@@ -135,7 +190,15 @@ module Rx = struct
         let seg = Segment.Rx.make ~sequence ~fin ~syn ~ack ~ack_number ~window ~data in
         let {rxq} = pcb in
         (* Coalesce any outstanding segments and retrieve ready segments *)
-        Segment.Rx.input rxq seg
+        let pcbLogInfo = pcb.logInfo in
+        if !(pcbLogInfo.doLogging) then
+			logRx pcbLogInfo.logHistory pcbLogInfo.historyLogLock sequence ack_number 
+			>>
+			Segment.Rx.input rxq seg
+			>>
+			logWindow pcbLogInfo.logHistory pcbLogInfo.historyLogLock pcb.wnd
+        else
+			Segment.Rx.input rxq seg
    
   (* Thread that spools the data into an application receive buffer,
      and notifies the ACK subsystem that new data is here *)
@@ -240,14 +303,20 @@ let new_pcb t ~rx_wnd ~rx_wnd_scale ~tx_wnd ~tx_wnd_scale ~sequence ~tx_mss ~tx_
   (* Set up transmit and receive queues *)
   let on_close () = clearpcb t id tx_isn in
   let state = State.t ~on_close in
-  let txq, tx_t = Segment.Tx.q ~xmit:(Tx.xmit_pcb t.ip id) ~wnd ~state ~rx_ack ~tx_ack ~tx_wnd_update in
+  (* Create the list for keeping TCP logs and the related lock  *)
+  let doLogging = ref false in
+  let logHistory = ref [] in
+  let historyLogLock = ref (Lwt_mutex.create ()) in
+  let logInfo = { doLogging; logHistory; historyLogLock } in
+  (* Create the transmit queue, attach it to the Segment module *)
+  let txq, tx_t = Segment.Tx.q ~xmit:(Tx.xmit_pcb t.ip id logInfo) ~wnd ~state ~rx_ack ~tx_ack ~tx_wnd_update in
   (* The user application transmit buffer *)
   let utx = User_buffer.Tx.create ~wnd ~txq ~max_size:16384l in
   let rxq = Segment.Rx.q ~rx_data ~wnd ~state ~tx_ack in
   (* Set up ACK module *)
   let ack = Ack.Delayed.t ~send_ack ~last:(Sequence.incr rx_isn) in
   (* Construct basic PCB in Syn_received state *)
-  let pcb = { state; rxq; txq; wnd; id; ack; urx; urx_close_t; urx_close_u; utx } in
+  let pcb = { state; rxq; txq; wnd; id; ack; urx; urx_close_t; urx_close_u; utx; logInfo } in
   (* Compose the overall thread from the various tx/rx threads
      and the main listener function *)
   let th =
@@ -494,6 +563,58 @@ let getid t dest_ip dest_port =
     if inuse t id then bumpport t else id
   in
   bumpport t
+  
+
+(* Start the logging of PCB events history (TX, RX, Window info).
+   Any previous history logs are cleared
+*)
+let startLogging pcb = 
+	Lwt_mutex.lock !((pcb.logInfo).historyLogLock) >>
+	if !((pcb.logInfo).doLogging) then
+	begin
+		Lwt_mutex.unlock !((pcb.logInfo).historyLogLock);
+		return false
+	end else
+	begin
+		(pcb.logInfo).logHistory := [] ;
+		(pcb.logInfo).doLogging := true ;
+		Lwt_mutex.unlock !((pcb.logInfo).historyLogLock);
+		return true
+	end
+
+(* Stop the logging of PCB events history *)
+let stopLogging pcb = 
+	Lwt_mutex.lock !((pcb.logInfo).historyLogLock) >>
+	if !((pcb.logInfo).doLogging) then
+	begin
+		(pcb.logInfo).doLogging := false;
+		Lwt_mutex.unlock !((pcb.logInfo).historyLogLock);
+		return true
+	end else
+	begin
+		Lwt_mutex.unlock !((pcb.logInfo).historyLogLock);
+		return false
+	end
+
+(* Empty the log history (free memory contents that are no longer needed) *)
+let cleanLog pcb = 
+	Lwt_mutex.lock !((pcb.logInfo).historyLogLock) >>
+	((pcb.logInfo).logHistory := [] ;
+	Lwt_mutex.unlock !((pcb.logInfo).historyLogLock);
+	return ())
+	
+
+(* Returns the raw log-history of the PCB *)
+let getRawLogDump pcb = 
+	!((pcb.logInfo).logHistory)
+	
+
+(* Returns a reversed copy (asceding time order) of the PCB log-history *)
+let getLogDumpCopy pcb = 
+	List.rev !((pcb.logInfo).logHistory)
+
+
+	
 
 
 (* SYN retransmission timer *)

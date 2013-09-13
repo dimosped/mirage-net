@@ -65,3 +65,5 @@ val max_rexmits_done : t -> bool
 
 val tx_totalbytes : t -> int
 val rx_totalbytes : t -> int
+
+val get_Snapshot_Log : t -> int array
